@@ -1,0 +1,35 @@
+# setuptools
+# pyaudio
+# SpeechRecognition
+# --extra-index-url https://download.pytorch.org/whl/cu118
+# torch
+# numpy
+# flask-sock
+# ngrok
+# twilio
+# python-dotenv
+# pytz
+# google-cloud-speech>=2.0.0
+# google-cloud-texttospeech>=2.0.0
+# google-cloud-aiplatform>=1.0.0
+# vertexai>=0.0.1
+# google-auth
+# google-auth-oauthlib
+# google-api-python-client
+
+#DIA requirements
+
+# flask
+flask-sock
+ngrok
+twilio
+python-dotenv
+pytz
+google-cloud-speech
+google-cloud-texttospeech
+google-auth
+google-auth-oauthlib
+google-api-python-client
+langchain-cohere
+cohere
+requests
