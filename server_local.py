@@ -87,20 +87,20 @@ def voice():
             response = VoiceResponse()
             response.say("Error. Please try again.", voice="Polly.Matthew")
             return str(response)
-        
+
         response = VoiceResponse()
         chain = create_conversation_chain(call_sid)
-        
+
         active_calls[call_sid] = {
             'conversation_chain': chain,
             'responses': [],
             'turn_count': 0,
             'start_time': datetime.datetime.now()
         }
-        
+
         greeting = "Hi, I'm your scheduling assistant. How can I help book or check appointments?"
         response.say(greeting, voice="Polly.Matthew", prosody={'rate': '95%'})
-        
+
         gather = Gather(
             input='speech',
             action='/process_speech',
@@ -109,54 +109,54 @@ def voice():
             language='en-US',
             bargeIn=True
         )
-        
+
         response.append(gather)
         response.say("Didn't catch that. Goodbye.", voice="Polly.Matthew")
         response.hangup()
-        
+
         return str(response)
-            
+
     except Exception as e:
         logger.error(f"Error in voice endpoint: {e}")
         response = VoiceResponse()
         response.say("Error. Try again later.", voice="Polly.Matthew")
         return str(response)
 
-#here the code which I need to change 
+#here the code which I need to change
 
 @app.route('/process_speech', methods=['POST'])
 def process_speech():
     try:
         call_sid = request.values.get('CallSid')
         speech_result = request.values.get('SpeechResult')
-        
+
         if not call_sid or not speech_result or call_sid not in active_calls:
             response = VoiceResponse()
             response.say("Sorry, connection error. Try again.", voice="Polly.Matthew")
             response.hangup()
             return str(response)
-            
+
         logger.info(f"User: '{speech_result}'")
-        
+
         ai_response = process_user_input(call_sid, speech_result)
         logger.info(f"AI: '{ai_response}'")
-        
+
         active_calls[call_sid]['responses'].append({
             'user': speech_result,
             'ai': ai_response,
             'timestamp': datetime.datetime.now().isoformat()
         })
         active_calls[call_sid]['turn_count'] += 1
-        
+
         response = VoiceResponse()
-        
+
         sentences = re.split(r'(?<=[.!?])\s+', ai_response.strip())
         if len(sentences) > 2:
             sentences = sentences[:2]
             ai_response = " ".join(sentences) + "."
-        
+
         response.say(ai_response, voice="Polly.Matthew", prosody={'rate': '95%'})
-        
+
         end_keywords = ["booked", "confirmed", "appointment is", "no appointments", "goodbye"]
         should_end_call = any(keyword in ai_response.lower() for keyword in end_keywords) or active_calls[call_sid]['turn_count'] >= 8
 
@@ -177,9 +177,9 @@ def process_speech():
             response.append(gather)
             response.say("Is there anything else?", voice="Polly.Matthew", prosody={'rate': '95%'})
             response.hangup()
-        
+
         return str(response)
-        
+
     except Exception as e:
         logger.error(f"Error in process_speech: {e}")
         response = VoiceResponse()
@@ -191,7 +191,7 @@ def process_user_input(call_sid, text):
     try:
         if call_sid not in active_calls:
             return "Sorry, connection issue. Try again."
-        
+
         call_data = active_calls[call_sid]
         conversation_chain = call_data['conversation_chain']
         history = get_session_history(call_sid).messages
@@ -199,7 +199,7 @@ def process_user_input(call_sid, text):
 
         retrieval_keywords = ["check", "when is", "what is", "do i have", "my appointment", "view appointment"]
         booking_keywords = ["schedule", "book", "make", "new appointment", "set up"]
-        
+
         is_retrieval_intent = any(keyword in text.lower() for keyword in retrieval_keywords)
         is_booking_intent = any(keyword in text.lower() for keyword in booking_keywords)
 
@@ -212,7 +212,7 @@ def process_user_input(call_sid, text):
                 end_of_day = start_of_day + datetime.timedelta(days=1)
                 time_min = LOCAL_TIMEZONE.localize(start_of_day).astimezone(pytz.utc).isoformat()
                 time_max = LOCAL_TIMEZONE.localize(end_of_day).astimezone(pytz.utc).isoformat()
-            
+
             try:
                 events = get_google_calendar_events(time_min=time_min, time_max=time_max)
                 if events:
@@ -225,7 +225,7 @@ def process_user_input(call_sid, text):
                             day = dt_local.strftime('%A')
                             time_str = dt_local.strftime('%I:%M %p').lstrip('0')
                             response_parts.append(f"{event_summary} on {day} at {time_str}")
-                    
+
                     if len(events) > 2:
                         response_parts.append("and more.")
 
@@ -239,7 +239,7 @@ def process_user_input(call_sid, text):
 
         else:
             logger.info("Detected BOOKING or GENERAL query intent.")
-            
+
             response = conversation_chain.invoke(
                 {"text": text},
                 config={"configurable": {"session_id": call_sid}}
@@ -252,13 +252,13 @@ def process_user_input(call_sid, text):
             if potential_booking_response or is_booking_intent:
                 appointment_datetime = parse_date_time(full_conversation_text)
                 purpose = extract_purpose(full_conversation_text)
-                
+
                 if appointment_datetime and purpose:
                     logger.info(f"Attempting to book based on conversation: {purpose} at {appointment_datetime}")
                     try:
                         duration = extract_appointment_duration(full_conversation_text)
                         calendar_result = create_google_calendar_event(purpose, appointment_datetime, duration)
-                        
+
                         if calendar_result and calendar_result.get('success'):
                             day_name = appointment_datetime.strftime('%A')
                             month_name = appointment_datetime.strftime('%B')
@@ -286,7 +286,7 @@ def process_user_input(call_sid, text):
                 response_content = " ".join(words[:15])
                 if response_content[-1] not in ".!?":
                     response_content += "."
-            
+
             return response_content
     
     except Exception as e:
@@ -294,18 +294,18 @@ def process_user_input(call_sid, text):
         return "Sorry, internal error. Try again."
 
 class InMemoryChatMessageHistory(BaseChatMessageHistory):
-    def _init_(self):
+    def __init__(self):
         self._messages = []
-    
+
     def add_message(self, message):
         self._messages.append(message)
-    
+
     def add_messages(self, messages):
         self._messages.extend(messages)
-    
+
     def clear(self):
         self._messages = []
-    
+
     @property
     def messages(self):
         return self._messages
@@ -320,7 +320,7 @@ def get_session_history(call_sid: str) -> BaseChatMessageHistory:
 def create_google_calendar_event(summary, start_time, duration_minutes=30, description=None):
     if not refresh_google_credentials():
         return {"success": False, "error": "Google Auth Failed"}
-    
+
     global calendar_service
     if not calendar_service:
         try:
@@ -328,14 +328,14 @@ def create_google_calendar_event(summary, start_time, duration_minutes=30, descr
         except Exception as e:
             logger.error(f"Failed to build calendar service: {e}")
             return {"success": False, "error": f"Failed to build calendar service: {e}"}
-    
+
     end_time = start_time + datetime.timedelta(minutes=duration_minutes)
-    
+
     if start_time.tzinfo is None:
         start_time = LOCAL_TIMEZONE.localize(start_time)
     if end_time.tzinfo is None:
         end_time = LOCAL_TIMEZONE.localize(end_time)
-    
+
     event = {
         'summary': summary,
         'description': description or f'Appointment scheduled via AI Assistant',
@@ -351,7 +351,7 @@ def create_google_calendar_event(summary, start_time, duration_minutes=30, descr
             'useDefault': True
         },
     }
-    
+
     for attempt in range(2):
         try:
             logger.info(f"Creating event: {json.dumps(event, default=str)}")
@@ -367,7 +367,7 @@ def create_google_calendar_event(summary, start_time, duration_minutes=30, descr
                 "link": created_event.get('htmlLink'),
                 "event_time": created_event.get('start', {}).get('dateTime')
             }
-            
+
         except Exception as e:
             logger.error(f"Calendar insert error (attempt {attempt+1}): {e}")
             error_details = getattr(e, 'content', str(e))
@@ -386,7 +386,7 @@ def create_google_calendar_event(summary, start_time, duration_minutes=30, descr
                 return {"success": False, "error": "Time conflict detected"}
             else:
                 time.sleep(1.5)
-    
+
     return {"success": False, "error": "Failed to create event after retries"}
 
 def get_google_calendar_events(time_min=None, time_max=None, max_results=5):
@@ -400,7 +400,7 @@ def get_google_calendar_events(time_min=None, time_max=None, max_results=5):
         except Exception as e:
             logger.error(f"Failed to build calendar service: {e}")
             raise ConnectionError(f"Failed to build calendar service: {e}")
-    
+
     if time_min is None:
         time_min = datetime.datetime.now(pytz.utc).isoformat()
 
@@ -414,11 +414,11 @@ def get_google_calendar_events(time_min=None, time_max=None, max_results=5):
             singleEvents=True,
             orderBy='startTime'
         ).execute()
-        
+
         events = events_result.get('items', [])
         logger.info(f"Found {len(events)} events.")
         return events
-        
+
     except Exception as e:
         logger.error(f"Error fetching Google Calendar events: {e}")
         error_details = getattr(e, 'content', str(e))
@@ -442,20 +442,20 @@ def get_google_calendar_events(time_min=None, time_max=None, max_results=5):
 
 def refresh_google_credentials(force=False):
     global creds, calendar_service
-    
+
     if creds and creds.valid and not force:
         return True
-    
+
     try:
         if os.path.exists('token.json'):
             creds = Credentials.from_authorized_user_file('token.json', SCOPES)
-            
+
             if creds and creds.expired and creds.refresh_token:
                 creds.refresh(Request())
                 with open('token.json', 'w') as f:
                     f.write(creds.to_json())
                 return True
-                
+
         if os.path.exists('credentials.json'):
             flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
             creds = flow.run_local_server(port=0)
@@ -465,7 +465,7 @@ def refresh_google_credentials(force=False):
         else:
             logger.error("No credentials.json file found")
             return False
-            
+
     except Exception as e:
         logger.error(f"Error refreshing credentials: {e}")
         return False
@@ -474,11 +474,11 @@ def refresh_google_credentials(force=False):
 
 def create_conversation_chain(call_sid):
     llm = init_cohere_llm()
-    
+
     system_prompt = """
     You're a concise AI scheduling assistant. Help users book OR check appointments.
     Keep responses VERY short (5-15 words). Ask clarifying questions one at a time.
-    
+
     RULES:
     - Be extremely brief.
     - If booking: Ask for purpose, date/time. Confirm details before booking.
@@ -486,7 +486,7 @@ def create_conversation_chain(call_sid):
     - Don't offer times, wait for user.
     - Use keywords like "schedule", "book", "confirm" when ready to call the booking function.
     - Use keywords like "check", "view", "look up" when ready to call the retrieval function.
-    
+
     EXAMPLES (Booking):
     User: "I need an appointment."
     AI: "Okay, what is the appointment for?"
@@ -494,36 +494,36 @@ def create_conversation_chain(call_sid):
     AI: "Got it. What day and time works?"
     User: "Tomorrow at 2pm."
     AI: "OK. Scheduling checkup for tomorrow 2pm." (Triggers booking function)
-    
+
     EXAMPLES (Retrieval):
     User: "Do I have an appointment on Friday?"
     AI: "Checking for Friday appointments..." (Triggers retrieval function)
     User: "When is my next appointment?"
     AI: "Let me check your upcoming appointments..." (Triggers retrieval function)
     """
-    
+
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
         MessagesPlaceholder(variable_name="history"),
         ("human", "{text}")
     ])
-    
+
     chain = prompt | llm
-    
+
     chain_with_history = RunnableWithMessageHistory(
         chain,
         get_session_history,
         input_messages_key="text",
         history_messages_key="history"
     )
-    
+
     return chain_with_history
 
 def init_cohere_llm():
     if not REQUIRED_ENV_VARS['COHERE_API_KEY']:
         logger.error("Cohere API key not found")
         exit(1)
-    
+
     llm = ChatCohere(
         model="command-r-plus",
         cohere_api_key=REQUIRED_ENV_VARS['COHERE_API_KEY'],
@@ -538,20 +538,20 @@ def init_cohere_llm():
 
 def start_ngrok():
     global ngrok_process
-    
+
     if NGROK_AUTH_TOKEN:
         subprocess.run(["ngrok", "config", "add-authtoken", NGROK_AUTH_TOKEN], check=True)
-    
+
     ngrok_process = subprocess.Popen(
         ["ngrok", "http", str(PORT)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         universal_newlines=True
     )
-    
+
     logger.info("Starting ngrok...")
     time.sleep(3)
-    
+
     try:
         response = requests.get("http://localhost:4040/api/tunnels")
         if response.status_code == 200:
@@ -567,15 +567,15 @@ def configure_twilio_webhook(ngrok_url):
     if not all([REQUIRED_ENV_VARS['TWILIO_ACCOUNT_SID'], REQUIRED_ENV_VARS['TWILIO_AUTH_TOKEN'], REQUIRED_ENV_VARS['TWILIO_PHONE_NUMBER']]):
         logger.warning(f"Twilio credentials missing. Please manually configure webhook to: {ngrok_url}/voice")
         return
-    
+
     try:
         webhook_url = f"{ngrok_url}/voice"
         update_url = f"https://api.twilio.com/2010-04-01/Accounts/{REQUIRED_ENV_VARS['TWILIO_ACCOUNT_SID']}/IncomingPhoneNumbers.json"
-        
+
         auth = (REQUIRED_ENV_VARS['TWILIO_ACCOUNT_SID'], REQUIRED_ENV_VARS['TWILIO_AUTH_TOKEN'])
         response = requests.get(update_url, auth=auth)
         phone_numbers = response.json().get('incoming_phone_numbers', [])
-            
+
         for phone in phone_numbers:
             if phone['phone_number'] == REQUIRED_ENV_VARS['TWILIO_PHONE_NUMBER'] or phone['phone_number'] == f"+{REQUIRED_ENV_VARS['TWILIO_PHONE_NUMBER']}":
                 phone_sid = phone['sid']
@@ -584,7 +584,7 @@ def configure_twilio_webhook(ngrok_url):
                     data={"VoiceUrl": webhook_url},
                     auth=auth
                 )
-                
+
                 if update_response.status_code == 200:
                     logger.info(f"Configured Twilio webhook to: {webhook_url}")
                 break
@@ -615,16 +615,16 @@ def setup():
     try:
         if not check_ngrok_installation():
             raise ValueError("ngrok is not properly installed")
-        
+
         if missing_vars:
             raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
-    
+
         refresh_google_credentials()
-        
+
         start_ngrok()
-        
+
         signal.signal(signal.SIGINT, lambda s, f: cleanup())
-        
+
     except Exception as e:
         logger.error(f"Setup failed: {e}")
         cleanup()
@@ -637,3 +637,4 @@ if __name__ == '__main__':
     except Exception as e:
         logger.error(f"Failed to start application: {e}")
         cleanup()
+        raise
