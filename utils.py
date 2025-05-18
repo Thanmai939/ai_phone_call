@@ -48,12 +48,16 @@ def parse_date_time(text):
         minute = int(time_match.group(2)) if time_match.group(2) else 0
         meridian = time_match.group(3)
         
-        if meridian:
-            if meridian.lower() == "pm" and hour < 12:
+        # Handle PM times
+        if meridian and meridian.lower() == "pm":
+            if hour != 12:  # Only add 12 if it's not already 12 PM
                 hour += 12
-            elif meridian.lower() == "am" and hour == 12:
+        # Handle AM times
+        elif meridian and meridian.lower() == "am":
+            if hour == 12:  # 12 AM should be 0
                 hour = 0
-        elif hour < 12 and "evening" in text:
+        # No meridian specified but context suggests evening
+        elif hour < 12 and ("evening" in text or "night" in text or "p.m." in text or "pm" in text):
             hour += 12
         
         target_date = target_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
