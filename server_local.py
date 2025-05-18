@@ -264,7 +264,7 @@ def process_user_input(call_sid, text):
                             month_name = appointment_datetime.strftime('%B')
                             day_num = appointment_datetime.strftime('%d').lstrip('0')
                             time_str = appointment_datetime.strftime('%I:%M %p').lstrip('0')
-                            return f"OK. Booked: {purpose} on {day_name}, {month_name} {day_num} at {time_str}."
+                            return f"Booked appointment for {day_name}, {month_name} {day_num} at {time_str}."
                         else:
                             error_detail = calendar_result.get("error", "unknown error")
                             logger.error(f"Calendar booking failed: {error_detail}")
@@ -337,8 +337,8 @@ def create_google_calendar_event(summary, start_time, duration_minutes=30, descr
         end_time = LOCAL_TIMEZONE.localize(end_time)
 
     event = {
-        'summary': summary,
-        'description': description or f'Appointment scheduled via AI Assistant',
+        'summary': 'Booked Appointment',  # Fixed summary for all appointments
+        'description': f'Purpose: {summary}',  # Original summary becomes the description
         'start': {
             'dateTime': start_time.isoformat(),
             'timeZone': LOCAL_TIMEZONE.zone,
