@@ -22,13 +22,36 @@ def parse_date_time(text):
         "friday": 4, "saturday": 5, "sunday": 6
     }
     
-    # Time patterns
-    time_pattern = r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?"
+    # Month patterns
+    month_patterns = {
+        "january": 1, "february": 2, "march": 3, "april": 4,
+        "may": 5, "june": 6, "july": 7, "august": 8,
+        "september": 9, "october": 10, "november": 11, "december": 12
+    }
+    
+    # Time patterns - updated to handle more formats including p.m. with periods
+    time_pattern = r"(\d{1,2})(?::(\d{2}))?\s*(?:a\.?m\.?|p\.?m\.?|am|pm)?"
     
     # Check for specific dates
-    target_date = now
+    target_date = None
     
-    if any(pattern in text for pattern in today_patterns):
+    # Try to match explicit date format (e.g., "May 29th, 2025" or "May 29, 2025")
+    date_pattern = r"(?:(\w+)\s+(\d{1,2})(?:st|nd|rd|th)?,?\s*(\d{4}))"
+    date_match = re.search(date_pattern, text)
+    
+    if date_match:
+        month_name = date_match.group(1).lower()
+        day = int(date_match.group(2).replace(",", ""))
+        year = int(date_match.group(3))
+        
+        if month_name in month_patterns:
+            month = month_patterns[month_name]
+            try:
+                target_date = datetime.datetime(year, month, day)
+            except ValueError:
+                logger.error(f"Invalid date: {year}-{month}-{day}")
+                return None
+    elif any(pattern in text for pattern in today_patterns):
         target_date = now
     elif any(pattern in text for pattern in tomorrow_patterns):
         target_date = now + datetime.timedelta(days=1)
@@ -41,27 +64,49 @@ def parse_date_time(text):
                 target_date = now + datetime.timedelta(days=days_ahead)
                 break
     
+    if target_date is None:
+        return None
+    
     # Extract time
     time_match = re.search(time_pattern, text)
     if time_match:
-        hour = int(time_match.group(1))
-        minute = int(time_match.group(2)) if time_match.group(2) else 0
-        meridian = time_match.group(3)
-        
-        # Handle PM times
-        if meridian and meridian.lower() == "pm":
-            if hour != 12:  # Only add 12 if it's not already 12 PM
-                hour += 12
-        # Handle AM times
-        elif meridian and meridian.lower() == "am":
-            if hour == 12:  # 12 AM should be 0
-                hour = 0
-        # No meridian specified but context suggests evening
-        elif hour < 12 and ("evening" in text or "night" in text or "p.m." in text or "pm" in text):
-            hour += 12
-        
-        target_date = target_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        return target_date
+        try:
+            hour = int(time_match.group(1))
+            minute = int(time_match.group(2)) if time_match.group(2) else 0
+            
+            # Check for PM in the text (including variations)
+            is_pm = any(pm in text for pm in ["p.m.", "pm", "p.m"])
+            is_am = any(am in text for am in ["a.m.", "am", "a.m"])
+            
+            # Handle PM times
+            if is_pm:
+                if hour != 12:  # Only add 12 if it's not already 12 PM
+                    hour = (hour + 12) % 24
+            # Handle AM times
+            elif is_am:
+                if hour == 12:  # 12 AM should be 0
+                    hour = 0
+            
+            # Validate hour is in valid range
+            if not (0 <= hour <= 23):
+                logger.error(f"Invalid hour value: {hour}")
+                return None
+                
+            if not (0 <= minute <= 59):
+                logger.error(f"Invalid minute value: {minute}")
+                return None
+            
+            # Create datetime with the correct hour and minute
+            target_date = target_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            
+            # Ensure the time is in the local timezone
+            if target_date.tzinfo is None:
+                target_date = LOCAL_TIMEZONE.localize(target_date)
+            
+            return target_date
+        except (ValueError, IndexError) as e:
+            logger.error(f"Error parsing time: {e}")
+            return None
     
     return None
 
@@ -80,7 +125,7 @@ def extract_purpose(text):
         if match:
             purpose = match.group(1).strip()
             # Clean up common words that might be captured
-            purpose = re.sub(r'\b(an?|the|at|on|for|about)\b', '', purpose).strip()
+            purpose = re.sub(r'\b(an?|the|at|on|for|about|book|appointment|schedule)\b', '', purpose).strip()
             if purpose:
                 return purpose.title()
     
@@ -89,10 +134,10 @@ def extract_purpose(text):
     if len(words) >= 2:
         for i in range(len(words)-1):
             phrase = f"{words[i]} {words[i+1]}"
-            if not any(word in phrase for word in ["today", "tomorrow", "am", "pm", "schedule", "book"]):
+            if not any(word in phrase.lower() for word in ["today", "tomorrow", "am", "pm", "schedule", "book", "appointment", "may", "june", "july", "august", "september", "october", "november", "december"]):
                 return phrase.title()
     
-    return None
+    return "General Appointment"  # Default purpose if none found
 
 def extract_appointment_duration(text):
     """Extract appointment duration in minutes from text"""
