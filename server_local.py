@@ -21,6 +21,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from utils import parse_date_time, extract_purpose, extract_appointment_duration
+from openai import OpenAI
 
 # Configure logging - simplified
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -57,15 +58,31 @@ LOCAL_TIMEZONE = pytz.timezone('Asia/Kolkata') # Define a global timezone
 
 @app.route('/', methods=['GET'])
 def index():
+    ngrok_url = get_ngrok_url()
+    if ngrok_url:
+        return f"""
+        <html>
+            <body>
+                <h1>AI Appointment Scheduler is running</h1>
+                <h2>Your ngrok URL is:</h2>
+                <p style="font-size: 20px; color: blue;">{ngrok_url}</p>
+                <h2>Twilio Webhook URL:</h2>
+                <p style="font-size: 20px; color: green;">{ngrok_url}/voice</p>
+                <p>Use this URL to configure your Twilio phone number's webhook.</p>
+            </body>
+        </html>
+        """
     return "AI Appointment Scheduler running"
 
 @app.route('/status', methods=['GET'])
 def status():
     active_call_count = len(active_calls)
+    ngrok_url = get_ngrok_url()
     return jsonify({
         "status": "running",
         "active_calls": active_call_count,
-        "ngrok_url": get_ngrok_url()
+        "ngrok_url": ngrok_url,
+        "webhook_url": f"{ngrok_url}/voice" if ngrok_url else None
     })
 
 def get_ngrok_url():
@@ -83,7 +100,11 @@ def get_ngrok_url():
 def voice():
     try:
         call_sid = request.values.get('CallSid')
+        logger.info(f"Received voice webhook request. CallSid: {call_sid}")
+        logger.info(f"Request values: {request.values}")
+        
         if not call_sid:
+            logger.error("No CallSid received in request")
             response = VoiceResponse()
             response.say("Error. Please try again.", voice="Polly.Matthew")
             return str(response)
@@ -99,6 +120,7 @@ def voice():
         }
 
         greeting = "Hi, I'm your scheduling assistant. How can I help book or check appointments?"
+        logger.info(f"Sending greeting for call {call_sid}")
         response.say(greeting, voice="Polly.Matthew", prosody={'rate': '95%'})
 
         gather = Gather(
@@ -114,15 +136,14 @@ def voice():
         response.say("Didn't catch that. Goodbye.", voice="Polly.Matthew")
         response.hangup()
 
+        logger.info(f"Returning TwiML response for call {call_sid}")
         return str(response)
 
     except Exception as e:
-        logger.error(f"Error in voice endpoint: {e}")
+        logger.error(f"Error in voice endpoint: {e}", exc_info=True)
         response = VoiceResponse()
         response.say("Error. Try again later.", voice="Polly.Matthew")
         return str(response)
-
-#here the code which I need to change
 
 @app.route('/process_speech', methods=['POST'])
 def process_speech():
@@ -260,6 +281,12 @@ def process_user_input(call_sid, text):
                         calendar_result = create_google_calendar_event(purpose, appointment_datetime, duration)
 
                         if calendar_result and calendar_result.get('success'):
+                            # Convert the time to local timezone for display
+                            if appointment_datetime.tzinfo is None:
+                                appointment_datetime = LOCAL_TIMEZONE.localize(appointment_datetime)
+                            else:
+                                appointment_datetime = appointment_datetime.astimezone(LOCAL_TIMEZONE)
+                                
                             day_name = appointment_datetime.strftime('%A')
                             month_name = appointment_datetime.strftime('%B')
                             day_num = appointment_datetime.strftime('%d').lstrip('0')
@@ -331,10 +358,16 @@ def create_google_calendar_event(summary, start_time, duration_minutes=30, descr
 
     end_time = start_time + datetime.timedelta(minutes=duration_minutes)
 
+    # Ensure times are in local timezone
     if start_time.tzinfo is None:
         start_time = LOCAL_TIMEZONE.localize(start_time)
+    else:
+        start_time = start_time.astimezone(LOCAL_TIMEZONE)
+        
     if end_time.tzinfo is None:
         end_time = LOCAL_TIMEZONE.localize(end_time)
+    else:
+        end_time = end_time.astimezone(LOCAL_TIMEZONE)
 
     event = {
         'summary': 'Booked Appointment',  # Fixed summary for all appointments
@@ -473,7 +506,7 @@ def refresh_google_credentials(force=False):
 # CONVERSATION CHAIN
 
 def create_conversation_chain(call_sid):
-    llm = init_cohere_llm()
+    client = OpenAI()
 
     system_prompt = """
     You're a concise AI scheduling assistant. Help users book OR check appointments.
@@ -486,6 +519,7 @@ def create_conversation_chain(call_sid):
     - Don't offer times, wait for user.
     - Use keywords like "schedule", "book", "confirm" when ready to call the booking function.
     - Use keywords like "check", "view", "look up" when ready to call the retrieval function.
+    - If user says "stop" or "wait", acknowledge and pause.
 
     EXAMPLES (Booking):
     User: "I need an appointment."
@@ -502,22 +536,51 @@ def create_conversation_chain(call_sid):
     AI: "Let me check your upcoming appointments..." (Triggers retrieval function)
     """
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        MessagesPlaceholder(variable_name="history"),
-        ("human", "{text}")
-    ])
+    def get_ai_response(text, history):
+        messages = [
+            {"role": "system", "content": system_prompt}
+        ]
+        
+        # Add conversation history
+        for msg in history:
+            messages.append({
+                "role": "assistant" if msg.type == "ai" else "user",
+                "content": msg.content
+            })
+        
+        # Add current message
+        messages.append({"role": "user", "content": text})
+        
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                temperature=0.4,
+                max_tokens=50,
+                presence_penalty=1.0,
+                frequency_penalty=1.0
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            logger.error(f"Error getting AI response: {e}")
+            return "Sorry, I'm having trouble processing that. Could you repeat?"
 
-    chain = prompt | llm
+    class CustomChain:
+        def __init__(self, call_sid):
+            self.call_sid = call_sid
+            self.history = get_session_history(call_sid)
 
-    chain_with_history = RunnableWithMessageHistory(
-        chain,
-        get_session_history,
-        input_messages_key="text",
-        history_messages_key="history"
-    )
+        def invoke(self, input_data, config=None):
+            text = input_data.get("text", "")
+            response = get_ai_response(text, self.history.messages)
+            
+            # Add to history
+            self.history.add_message({"type": "user", "content": text})
+            self.history.add_message({"type": "ai", "content": response})
+            
+            return type('Response', (), {'content': response})()
 
-    return chain_with_history
+    return CustomChain(call_sid)
 
 def init_cohere_llm():
     if not REQUIRED_ENV_VARS['COHERE_API_KEY']:
@@ -553,13 +616,13 @@ def start_ngrok():
     time.sleep(3)
 
     try:
-        response = requests.get("http://localhost:4040/api/tunnels")
-        if response.status_code == 200:
-            tunnels = response.json().get('tunnels', [])
-            if tunnels and len(tunnels) > 0:
-                ngrok_url = tunnels[0].get('public_url')
-                logger.info(f"ngrok URL: {ngrok_url}")
-                configure_twilio_webhook(ngrok_url)
+        ngrok_url = get_ngrok_url()
+        if ngrok_url:
+            logger.info(f"ngrok URL: {ngrok_url}")
+            logger.info(f"Twilio webhook URL: {ngrok_url}/voice")
+            configure_twilio_webhook(ngrok_url)
+        else:
+            logger.error("Failed to get ngrok URL")
     except Exception as e:
         logger.error(f"Error getting ngrok URL: {e}")
 
@@ -570,26 +633,64 @@ def configure_twilio_webhook(ngrok_url):
 
     try:
         webhook_url = f"{ngrok_url}/voice"
+        logger.info(f"Configuring Twilio webhook to: {webhook_url}")
+        
+        # First, validate the phone number format
+        phone_number = REQUIRED_ENV_VARS['TWILIO_PHONE_NUMBER']
+        if not phone_number.startswith('+'):
+            phone_number = '+' + phone_number
+            logger.info(f"Added + prefix to phone number: {phone_number}")
+        
+        # Get all phone numbers
         update_url = f"https://api.twilio.com/2010-04-01/Accounts/{REQUIRED_ENV_VARS['TWILIO_ACCOUNT_SID']}/IncomingPhoneNumbers.json"
-
         auth = (REQUIRED_ENV_VARS['TWILIO_ACCOUNT_SID'], REQUIRED_ENV_VARS['TWILIO_AUTH_TOKEN'])
+        
         response = requests.get(update_url, auth=auth)
+        logger.info(f"Twilio API response status: {response.status_code}")
+        
+        if response.status_code != 200:
+            logger.error(f"Failed to get phone numbers: {response.text}")
+            return
+            
         phone_numbers = response.json().get('incoming_phone_numbers', [])
+        logger.info(f"Found {len(phone_numbers)} phone numbers")
+        
+        if not phone_numbers:
+            logger.error("No phone numbers found in your Twilio account. Please purchase a phone number first.")
+            logger.error("Go to: https://console.twilio.com > Phone Numbers > Get a phone number")
+            return
 
+        # Try to find the phone number
+        found_number = None
         for phone in phone_numbers:
-            if phone['phone_number'] == REQUIRED_ENV_VARS['TWILIO_PHONE_NUMBER'] or phone['phone_number'] == f"+{REQUIRED_ENV_VARS['TWILIO_PHONE_NUMBER']}":
-                phone_sid = phone['sid']
-                update_response = requests.post(
-                    f"https://api.twilio.com/2010-04-01/Accounts/{REQUIRED_ENV_VARS['TWILIO_ACCOUNT_SID']}/IncomingPhoneNumbers/{phone_sid}.json",
-                    data={"VoiceUrl": webhook_url},
-                    auth=auth
-                )
-
-                if update_response.status_code == 200:
-                    logger.info(f"Configured Twilio webhook to: {webhook_url}")
+            if phone['phone_number'] == phone_number or phone['phone_number'] == f"+{phone_number}":
+                found_number = phone
                 break
+
+        if not found_number:
+            logger.error(f"Phone number {phone_number} not found in your Twilio account.")
+            logger.error("Available numbers:")
+            for phone in phone_numbers:
+                logger.error(f"- {phone['phone_number']}")
+            return
+
+        # Update the webhook for the found number
+        phone_sid = found_number['sid']
+        logger.info(f"Updating webhook for phone number: {found_number['phone_number']}")
+        
+        update_response = requests.post(
+            f"https://api.twilio.com/2010-04-01/Accounts/{REQUIRED_ENV_VARS['TWILIO_ACCOUNT_SID']}/IncomingPhoneNumbers/{phone_sid}.json",
+            data={"VoiceUrl": webhook_url},
+            auth=auth
+        )
+
+        if update_response.status_code == 200:
+            logger.info(f"Successfully configured Twilio webhook to: {webhook_url}")
+        else:
+            logger.error(f"Failed to update webhook: {update_response.text}")
+            
     except Exception as e:
-        logger.error(f"Error configuring Twilio webhook: {e}")
+        logger.error(f"Error configuring Twilio webhook: {e}", exc_info=True)
 
 def check_ngrok_installation():
     try:
@@ -619,10 +720,22 @@ def setup():
         if missing_vars:
             raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
 
+        # Validate Twilio credentials
+        if not REQUIRED_ENV_VARS['TWILIO_ACCOUNT_SID'] or not REQUIRED_ENV_VARS['TWILIO_AUTH_TOKEN']:
+            raise ValueError("Twilio Account SID and Auth Token are required")
+        
+        if not REQUIRED_ENV_VARS['TWILIO_PHONE_NUMBER']:
+            raise ValueError("Twilio Phone Number is required")
+            
+        # Test Twilio credentials
+        try:
+            account = twilio_client.api.accounts(REQUIRED_ENV_VARS['TWILIO_ACCOUNT_SID']).fetch()
+            logger.info(f"Successfully connected to Twilio account: {account.friendly_name}")
+        except Exception as e:
+            raise ValueError(f"Invalid Twilio credentials: {str(e)}")
+
         refresh_google_credentials()
-
         start_ngrok()
-
         signal.signal(signal.SIGINT, lambda s, f: cleanup())
 
     except Exception as e:
