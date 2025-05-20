@@ -8,9 +8,11 @@ import subprocess
 import signal
 import pytz
 import re
+import asyncio
 from dotenv import load_dotenv
-from flask import Flask, request, jsonify
-from twilio.twiml.voice_response import VoiceResponse, Gather
+from flask import Flask, request, jsonify, Response, send_file
+from flask_sock import Sock
+from twilio.twiml.voice_response import VoiceResponse, Gather, Connect
 from twilio.rest import Client
 from langchain_cohere import ChatCohere
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -22,6 +24,10 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from utils import parse_date_time, extract_purpose, extract_appointment_duration
 from openai import OpenAI
+from transcribe import OpenAITranscriber, OpenAITTS
+import base64
+from flask.views import View
+from functools import wraps
 
 # Configure logging - simplified
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -32,20 +38,38 @@ load_dotenv()
 
 # Initialize Flask app
 app = Flask(__name__)
+app.config['PROPAGATE_EXCEPTIONS'] = True
+sock = Sock(app)
+
+# Add async support
+def async_route(f):
+    @wraps(f)
+    def wrapped(*args, **kwargs):
+        return asyncio.run(f(*args, **kwargs))
+    return wrapped
 
 # Key environment variables
 REQUIRED_ENV_VARS = {
     'COHERE_API_KEY': os.getenv('COHERE_API_KEY'),
     'TWILIO_ACCOUNT_SID': os.getenv('TWILIO_ACCOUNT_SID'),
     'TWILIO_AUTH_TOKEN': os.getenv('TWILIO_AUTH_TOKEN'),
-    'TWILIO_PHONE_NUMBER': os.getenv('TWILIO_PHONE_NUMBER')
+    'TWILIO_PHONE_NUMBER': os.getenv('TWILIO_PHONE_NUMBER'),
+    'OPENAI_API_KEY': os.getenv('OPENAI_API_KEY')
 }
 missing_vars = [var for var, value in REQUIRED_ENV_VARS.items() if not value]
+if missing_vars:
+    raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
+
 NGROK_AUTH_TOKEN = os.getenv("NGROK_AUTH_TOKEN")
 PORT = int(os.getenv("PORT", 5000))
 
 # Initialize Twilio client
 twilio_client = Client(REQUIRED_ENV_VARS['TWILIO_ACCOUNT_SID'], REQUIRED_ENV_VARS['TWILIO_AUTH_TOKEN'])
+
+# Initialize OpenAI services
+print("Initializing OpenAI services...")
+openai_tts = OpenAITTS(REQUIRED_ENV_VARS['OPENAI_API_KEY'])
+print("OpenAI services initialized successfully!")
 
 # Global variables
 SCOPES = ['https://www.googleapis.com/auth/calendar']
@@ -55,6 +79,74 @@ active_calls = {}
 conversation_histories = {}
 ngrok_process = None
 LOCAL_TIMEZONE = pytz.timezone('Asia/Kolkata') # Define a global timezone
+
+# WebSocket route for streaming audio
+@sock.route('/transcribe')
+def transcribe_websocket(ws):
+    transcriber = None
+    is_initialized = False
+    
+    try:
+        # Get call_sid from query parameters
+        call_sid = request.args.get('call_sid')
+        if not call_sid:
+            logger.error("No call_sid in WebSocket URL")
+            return
+            
+        while True:
+            message = ws.receive()
+            if message is None:
+                break
+                
+            try:
+                data = json.loads(message)
+                if data.get('event') == 'start':
+                    logger.info(f"Initializing OpenAI GPT-4o-mini-transcribe for call {call_sid}...")
+                    transcriber = OpenAITranscriber(REQUIRED_ENV_VARS['OPENAI_API_KEY'])
+                    transcriber.connect()
+                    is_initialized = True
+                    logger.info(f"OpenAI GPT-4o-mini-transcribe service connected for call {call_sid}")
+                    
+                elif data.get('event') == 'media':
+                    if not is_initialized or not transcriber:
+                        # Instead of error, just wait for initialization
+                        continue
+                        
+                    payload = data.get('media', {}).get('payload')
+                    if payload:
+                        try:
+                            # Decode base64 audio data
+                            audio_data = base64.b64decode(payload)
+                            transcriber.stream(audio_data)
+                            if transcriber.current_transcript:
+                                ws.send(json.dumps({
+                                    'event': 'transcription',
+                                    'text': transcriber.current_transcript
+                                }))
+                        except Exception as e:
+                            logger.error(f"Error processing audio data for call {call_sid}: {e}")
+                            continue
+                            
+                elif data.get('event') == 'stop':
+                    if transcriber:
+                        transcriber.close()
+                        is_initialized = False
+                        logger.info(f"OpenAI GPT-4o-mini-transcribe service disconnected for call {call_sid}")
+                    break
+                    
+            except json.JSONDecodeError:
+                logger.error(f"Invalid JSON received for call {call_sid}")
+                continue
+            except Exception as e:
+                logger.error(f"Error processing WebSocket message for call {call_sid}: {e}")
+                continue
+                
+    except Exception as e:
+        logger.error(f"WebSocket error for call {call_sid}: {e}")
+    finally:
+        if transcriber:
+            transcriber.close()
+            logger.info(f"Cleaned up transcriber for call {call_sid}")
 
 @app.route('/', methods=['GET'])
 def index():
@@ -97,7 +189,8 @@ def get_ngrok_url():
     return None
 
 @app.route('/voice', methods=['POST'])
-def voice():
+@async_route
+async def voice():
     try:
         call_sid = request.values.get('CallSid')
         logger.info(f"Received voice webhook request. CallSid: {call_sid}")
@@ -121,7 +214,34 @@ def voice():
 
         greeting = "Hi, I'm your scheduling assistant. How can I help book or check appointments?"
         logger.info(f"Sending greeting for call {call_sid}")
-        response.say(greeting, voice="Polly.Matthew", prosody={'rate': '95%'})
+        
+        # Generate greeting audio using OpenAI TTS
+        print("Generating greeting using OpenAI GPT-4o-mini-tts...")
+        greeting_audio = await openai_tts.synthesize_speech(greeting)
+        if not greeting_audio:
+            raise Exception("Failed to generate greeting audio")
+            
+        # Save the audio to a temporary file
+        temp_audio_path = f"temp_audio_{call_sid}.mp3"
+        with open(temp_audio_path, "wb") as f:
+            f.write(greeting_audio)
+        logger.info(f"Saved audio to {temp_audio_path}")
+
+        # Create TwiML response
+        response = VoiceResponse()
+        
+        # Get the base URL from the request
+        base_url = request.url_root.rstrip('/')
+        audio_url = f"{base_url}/audio/{temp_audio_path}"
+        logger.info(f"Audio URL: {audio_url}")
+        
+        # Add the play verb with the full URL
+        response.play(audio_url)
+
+        # Connect to WebSocket for streaming transcription with call_sid in URL
+        connect = Connect()
+        connect.stream(url=f'wss://{request.host}/transcribe?call_sid={call_sid}')
+        response.append(connect)
 
         gather = Gather(
             input='speech',
@@ -136,34 +256,41 @@ def voice():
         response.say("Didn't catch that. Goodbye.", voice="Polly.Matthew")
         response.hangup()
 
-        logger.info(f"Returning TwiML response for call {call_sid}")
-        return str(response)
+        # Log the TwiML response for debugging
+        twiml_response = str(response)
+        logger.info(f"Generated TwiML response: {twiml_response}")
+
+        return Response(twiml_response, mimetype='text/xml')
 
     except Exception as e:
         logger.error(f"Error in voice endpoint: {e}", exc_info=True)
         response = VoiceResponse()
         response.say("Error. Try again later.", voice="Polly.Matthew")
-        return str(response)
+        return Response(str(response), mimetype='text/xml')
 
 @app.route('/process_speech', methods=['POST'])
-def process_speech():
+@async_route
+async def process_speech():
     try:
         call_sid = request.values.get('CallSid')
         speech_result = request.values.get('SpeechResult')
+        transcription = request.values.get('TranscriptionText')  # Get transcription from WebSocket
 
-        if not call_sid or not speech_result or call_sid not in active_calls:
+        if not call_sid or (not speech_result and not transcription) or call_sid not in active_calls:
             response = VoiceResponse()
             response.say("Sorry, connection error. Try again.", voice="Polly.Matthew")
             response.hangup()
-            return str(response)
+            return Response(str(response), mimetype='text/xml')
 
-        logger.info(f"User: '{speech_result}'")
+        # Use transcription if available, otherwise fall back to speech_result
+        user_input = transcription if transcription else speech_result
+        logger.info(f"User: '{user_input}'")
 
-        ai_response = process_user_input(call_sid, speech_result)
+        ai_response = process_user_input(call_sid, user_input)
         logger.info(f"AI: '{ai_response}'")
 
         active_calls[call_sid]['responses'].append({
-            'user': speech_result,
+            'user': user_input,
             'ai': ai_response,
             'timestamp': datetime.datetime.now().isoformat()
         })
@@ -176,17 +303,58 @@ def process_speech():
             sentences = sentences[:2]
             ai_response = " ".join(sentences) + "."
 
-        response.say(ai_response, voice="Polly.Matthew", prosody={'rate': '95%'})
+        # Generate response audio using OpenAI TTS
+        print("Generating response using OpenAI GPT-4o-mini-tts...")
+        response_audio = await openai_tts.synthesize_speech(ai_response)
+        if not response_audio:
+            raise Exception("Failed to generate response audio")
+            
+        # Save the audio to a temporary file
+        temp_audio_path = f"temp_audio_{call_sid}_response.mp3"
+        with open(temp_audio_path, "wb") as f:
+            f.write(response_audio)
+        logger.info(f"Saved response audio to {temp_audio_path}")
+
+        # Get the base URL from the request
+        base_url = request.url_root.rstrip('/')
+        audio_url = f"{base_url}/audio/{temp_audio_path}"
+        logger.info(f"Response audio URL: {audio_url}")
+        
+        # Add the play verb with the full URL
+        response.play(audio_url)
 
         end_keywords = ["booked", "confirmed", "appointment is", "no appointments", "goodbye"]
         should_end_call = any(keyword in ai_response.lower() for keyword in end_keywords) or active_calls[call_sid]['turn_count'] >= 8
 
         if should_end_call:
-            response.say("Thanks. Goodbye.", voice="Polly.Matthew")
+            goodbye = "Thanks. Goodbye."
+            # Generate goodbye audio using OpenAI TTS
+            print("Generating goodbye using OpenAI GPT-4o-mini-tts...")
+            goodbye_audio = await openai_tts.synthesize_speech(goodbye)
+            if not goodbye_audio:
+                raise Exception("Failed to generate goodbye audio")
+                
+            # Save the audio to a temporary file
+            goodbye_path = f"temp_audio_{call_sid}_goodbye.mp3"
+            with open(goodbye_path, "wb") as f:
+                f.write(goodbye_audio)
+            logger.info(f"Saved goodbye audio to {goodbye_path}")
+
+            # Get the base URL from the request
+            goodbye_url = f"{base_url}/audio/{goodbye_path}"
+            logger.info(f"Goodbye audio URL: {goodbye_url}")
+            
+            # Add the play verb with the full URL
+            response.play(goodbye_url)
             response.hangup()
             if call_sid in active_calls: del active_calls[call_sid]
             if call_sid in conversation_histories: del conversation_histories[call_sid]
         else:
+            # Connect to WebSocket for streaming transcription with call_sid in URL
+            connect = Connect()
+            connect.stream(url=f'wss://{request.host}/transcribe?call_sid={call_sid}')
+            response.append(connect)
+
             gather = Gather(
                 input='speech',
                 action='/process_speech',
@@ -196,17 +364,52 @@ def process_speech():
                 bargeIn=True
             )
             response.append(gather)
-            response.say("Is there anything else?", voice="Polly.Matthew", prosody={'rate': '95%'})
+            followup = "Is there anything else?"
+            # Generate followup audio using OpenAI TTS
+            print("Generating followup using OpenAI GPT-4o-mini-tts...")
+            followup_audio = await openai_tts.synthesize_speech(followup)
+            if not followup_audio:
+                raise Exception("Failed to generate followup audio")
+                
+            # Save the audio to a temporary file
+            followup_path = f"temp_audio_{call_sid}_followup.mp3"
+            with open(followup_path, "wb") as f:
+                f.write(followup_audio)
+            logger.info(f"Saved followup audio to {followup_path}")
+
+            # Get the base URL from the request
+            followup_url = f"{base_url}/audio/{followup_path}"
+            logger.info(f"Followup audio URL: {followup_url}")
+            
+            # Add the play verb with the full URL
+            response.play(followup_url)
             response.hangup()
 
-        return str(response)
+        # Log the TwiML response for debugging
+        twiml_response = str(response)
+        logger.info(f"Generated TwiML response: {twiml_response}")
+
+        return Response(twiml_response, mimetype='text/xml')
 
     except Exception as e:
         logger.error(f"Error in process_speech: {e}")
         response = VoiceResponse()
         response.say("Error processing request. Try again.", voice="Polly.Matthew")
         response.hangup()
-        return str(response)
+        return Response(str(response), mimetype='text/xml')
+
+@app.route('/audio/<path:filename>')
+def serve_audio(filename):
+    try:
+        # Ensure the file exists
+        if not os.path.exists(filename):
+            logger.error(f"Audio file not found: {filename}")
+            return Response("Audio file not found", status=404)
+            
+        return send_file(filename, mimetype='audio/mpeg')
+    except Exception as e:
+        logger.error(f"Error serving audio file {filename}: {e}")
+        return Response("Error serving audio file", status=500)
 
 def process_user_input(call_sid, text):
     try:
@@ -506,7 +709,15 @@ def refresh_google_credentials(force=False):
 # CONVERSATION CHAIN
 
 def create_conversation_chain(call_sid):
-    client = OpenAI()
+    # Initialize Cohere client
+    llm = ChatCohere(
+        model="command-r-plus",
+        cohere_api_key=REQUIRED_ENV_VARS['COHERE_API_KEY'],
+        temperature=0.4,
+        max_tokens=50,
+        presence_penalty=1.0,
+        frequency_penalty=1.0
+    )
 
     system_prompt = """
     You're a concise AI scheduling assistant. Help users book OR check appointments.
@@ -537,30 +748,28 @@ def create_conversation_chain(call_sid):
     """
 
     def get_ai_response(text, history):
-        messages = [
-            {"role": "system", "content": system_prompt}
-        ]
-        
-        # Add conversation history
-        for msg in history:
-            messages.append({
-                "role": "assistant" if msg.type == "ai" else "user",
-                "content": msg.content
-            })
-        
-        # Add current message
-        messages.append({"role": "user", "content": text})
-        
         try:
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=messages,
-                temperature=0.4,
-                max_tokens=50,
-                presence_penalty=1.0,
-                frequency_penalty=1.0
-            )
-            return response.choices[0].message.content
+            # Format conversation history for Cohere
+            conversation = []
+            for msg in history:
+                conversation.append({
+                    "role": "assistant" if msg.type == "ai" else "user",
+                    "content": msg.content
+                })
+            
+            # Add current message
+            conversation.append({"role": "user", "content": text})
+            
+            # Create prompt with system message and conversation
+            prompt = f"{system_prompt}\n\n"
+            for msg in conversation:
+                role = "Assistant" if msg["role"] == "assistant" else "User"
+                prompt += f"{role}: {msg['content']}\n"
+            
+            # Get response from Cohere
+            response = llm.invoke(prompt)
+            return response.content
+            
         except Exception as e:
             logger.error(f"Error getting AI response: {e}")
             return "Sorry, I'm having trouble processing that. Could you repeat?"
