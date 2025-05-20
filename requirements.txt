@@ -25,11 +25,11 @@ ngrok
 twilio
 python-dotenv
 pytz
-google-cloud-speech
-google-cloud-texttospeech
+openai>=1.0.0
 google-auth
 google-auth-oauthlib
 google-api-python-client
 langchain-cohere
 cohere
 requests
+aiohttp  # Added for async support
