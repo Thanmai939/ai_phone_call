@@ -1,58 +1,62 @@
-from google.cloud import speech
 import json
 import queue
 import threading
-from google.cloud import texttospeech
+import asyncio
+import logging
+from openai import OpenAI
+from openai.helpers import LocalAudioPlayer
+import base64
+import io
+from openai import AsyncOpenAI
 
-class GoogleTranscriber:
-    def __init__(self, credentials_path):
-        """Initialize the Google Cloud Speech-to-Text client"""
-        self.client = speech.SpeechClient.from_service_account_json(credentials_path)
-        self.streaming_config = speech.StreamingRecognitionConfig(
-            config=speech.RecognitionConfig(
-                encoding=speech.RecognitionConfig.AudioEncoding.MULAW,
-                sample_rate_hertz=8000,
-                language_code="en-US",
-                enable_automatic_punctuation=True,
-            ),
-            interim_results=True,
-        )
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class OpenAITranscriber:
+    def __init__(self, OPENAI_API_KEY):
+        """Initialize the OpenAI client"""
+        if not OPENAI_API_KEY:
+            raise ValueError("OpenAI API key is not configured")
+        logger.info("Initializing OpenAI Whisper transcription service...")
+        self.client = OpenAI(api_key=OPENAI_API_KEY)
         self.audio_queue = queue.Queue()
         self.is_active = False
         self.current_transcript = ""
         self._setup_streaming()
+        logger.info("OpenAI Whisper transcription service initialized successfully!")
 
     def _setup_streaming(self):
         """Setup the streaming recognition thread"""
         def streaming_recognize():
             while self.is_active:
-                # The audio stream to send to Google Cloud Speech-to-Text
-                def audio_generator():
-                    while self.is_active:
-                        try:
-                            chunk = self.audio_queue.get(timeout=2.0)
-                            yield speech.StreamingRecognizeRequest(audio_content=chunk)
-                        except queue.Empty:
-                            continue
-
                 try:
-                    requests = audio_generator()
-                    responses = self.client.streaming_recognize(
-                        config=self.streaming_config,
-                        requests=requests
+                    chunk = self.audio_queue.get(timeout=2.0)
+                    if not chunk:
+                        continue
+                        
+                    # Create a file-like object from the audio chunk
+                    audio_file = io.BytesIO(chunk)
+                    
+                    logger.info("Starting OpenAI Whisper transcription streaming...")
+                    # Create streaming transcription
+                    stream = self.client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=audio_file,
+                        response_format="text",
+                        stream=True
                     )
+                    
+                    # Process streaming events
+                    for event in stream:
+                        if event:
+                            logger.info(f"OpenAI Whisper transcription received: {event}")
+                            self.current_transcript = event
 
-                    for response in responses:
-                        if not response.results:
-                            continue
-
-                        result = response.results[0]
-                        if result.is_final:
-                            self.current_transcript = result.alternatives[0].transcript
-                            print(f"Final transcript: {self.current_transcript}")
-
+                except queue.Empty:
+                    continue
                 except Exception as e:
-                    print(f"Error in streaming recognition: {e}")
+                    logger.error(f"Error in OpenAI Whisper transcription streaming: {e}")
                     if self.is_active:  # Only retry if still active
                         self._setup_streaming()
 
@@ -63,41 +67,96 @@ class GoogleTranscriber:
     def connect(self):
         """Start the transcription service"""
         self.is_active = True
-        print("Google Speech-to-Text service connected")
+        logger.info("OpenAI Whisper transcription service connected")
 
     def stream(self, audio_chunk):
-        """Stream audio data to Google Cloud Speech-to-Text"""
-        if self.is_active:
-            self.audio_queue.put(audio_chunk)
+        """Stream audio data to OpenAI"""
+        if self.is_active and audio_chunk:
+            try:
+                self.audio_queue.put(audio_chunk)
+            except Exception as e:
+                logger.error(f"Error queueing audio chunk: {e}")
 
     def close(self):
         """Close the transcription service"""
         self.is_active = False
-        print("Google Speech-to-Text service disconnected")
+        logger.info("OpenAI Whisper transcription service disconnected")
 
-class GoogleTTS:
-    def __init__(self, credentials_path):
-        """Initialize the Google Cloud Text-to-Speech client"""
-        self.client = texttospeech.TextToSpeechClient.from_service_account_json(credentials_path)
+# class OpenAITTS:
+#     def __init__(self, OPENAI_API_KEY):
+#         """Initialize the OpenAI client"""
+#         if not OPENAI_API_KEY:
+#             raise ValueError("OpenAI API key is not configured")
+#         logger.info("Initializing OpenAI TTS service...")
+#         self.client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+#         logger.info("OpenAI TTS service initialized successfully!")
 
-    def synthesize_speech(self, text):
-        """Convert text to speech"""
-        synthesis_input = texttospeech.SynthesisInput(text=text)
-        voice = texttospeech.VoiceSelectionParams(
-            language_code="en-US",
-            name="en-US-Standard-I",  # You can change this to other available voices
-            ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL
-        )
-        audio_config = texttospeech.AudioConfig(
-            audio_encoding=texttospeech.AudioEncoding.MP3,
-            speaking_rate=1.0,
-            pitch=0.0
-        )
+#     async def synthesize_speech(self, text):
+#         """Convert text to speech using OpenAI's TTS with streaming response"""
+#         try:
+#             logger.info("Starting OpenAI TTS synthesis...")
+#             async with self.client.audio.speech.with_streaming_response.create(
+#                 model="tts-1",
+#                 voice="alloy",
+#                 input=text,
+#                 response_format="mp3"
+#             ) as response:
+#                 # Get the audio content from the streaming response
+#                 audio_content = await response.read()
+#                 logger.info("OpenAI TTS synthesis completed successfully!")
+#                 return audio_content
+                
+#         except Exception as e:
+#             logger.error(f"Error in OpenAI TTS synthesis: {e}")
+#             return None 
+class OpenAITTS:
+    def __init__(self, OPENAI_API_KEY: str):
+        """
+        Initialize the OpenAI client.
 
-        response = self.client.synthesize_speech(
-            input=synthesis_input,
-            voice=voice,
-            audio_config=audio_config
-        )
+        Args:
+            OPENAI_API_KEY (str): Your OpenAI API key.
+        
+        Raises:
+            ValueError: If the OpenAI API key is not configured.
+        """
+        if not OPENAI_API_KEY:
+            raise ValueError("OpenAI API key is not configured")
+        logger.info("Initializing OpenAI TTS service...")
+        # Initialize AsyncOpenAI for asynchronous operations
+        self.client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+        logger.info("OpenAI TTS service initialized successfully!")
 
-        return response.audio_content
+    async def synthesize_speech(self, text: str) -> bytes | None:
+        """
+        Convert text to speech using OpenAI's TTS with streaming response.
+        Uses the 'gpt-4o-mini-tts' model with an 'alloy' voice and an
+        'eternal optimist' tone.
+
+        Args:
+            text (str): The text to convert to speech.
+
+        Returns:
+            bytes | None: The audio content in MP3 format as bytes, or None if an error occurs.
+        """
+        try:
+            logger.info("Starting OpenAI TTS synthesis...")
+            # Initiate the streaming Text-to-Speech request
+            # Using 'async with' ensures the response stream is properly handled and closed.
+            async with self.client.audio.speech.with_streaming_response.create(
+                model="gpt-4o-mini-tts",  # Changed model to gpt-4o-mini-tts
+                voice="alloy",            # Using the 'alloy' voice
+                input=text,               # The text to be synthesized
+                response_format="mp3",    # Requesting the audio in MP3 format
+                # Added instructions parameter to guide the tone of voice
+                instructions="Speak in a cheerful and positive tone, like an eternal optimist."
+            ) as response:
+                # Read the entire audio content from the streaming response.
+                # 'await' is used because response.read() is an asynchronous operation.
+                audio_content = await response.read()
+                logger.info("OpenAI TTS synthesis completed successfully with gpt-4o-mini-tts and optimist tone!")
+                return audio_content
+
+        except Exception as e:
+            logger.error(f"Error in OpenAI TTS synthesis: {e}")
+            return None
